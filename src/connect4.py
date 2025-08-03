@@ -85,14 +85,6 @@ class Connect4Game:
                 print("\nSaindo do jogo...")
                 break
 
-    def reset_board(self):
-      empty_board = [[None for _ in range(7)] for _ in range(6)]
-      with Lock(self.zk, '/connect4/lock'):  
-          self.zk.set('/connect4/board', json.dumps(empty_board).encode())
-          self.zk.set('/connect4/turn', b"player1")  
-      self.board = empty_board
-      print("Tabuleiro reiniciado! Player 1 começa.")
-
     def handle_turn(self):
         with self.turn_lock:  
             current_turn, _ = self.zk.get('/connect4/turn')
@@ -118,7 +110,7 @@ class Connect4Game:
                     next_player = "player2" if self.player_id == "player1" else "player1"
                     self.zk.set("/connect4/turn", next_player.encode())
                     if self.check_winner(row, col):
-                        print(f"🎉 {self.player_id} venceu!")
+                        print(f"{self.player_id} venceu!")
                         self.zk.set("/connect4/winner", self.player_id.encode())
                         self.print_board()
                         self.zk.stop()
