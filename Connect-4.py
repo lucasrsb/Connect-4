@@ -180,9 +180,7 @@ class JogoConnect4:
         
         self._iniciar_observadores()
         print("\n=== VALENDO! ===")
-        self._mostrar_tabuleiro()
 
-        # Loop principal do jogo
         while not self.jogo_acabou.is_set():
             if self.minha_vez.wait(timeout=1.0):
                 self._fazer_minha_jogada()
