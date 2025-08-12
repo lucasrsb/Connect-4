@@ -17,8 +17,8 @@ jogadores, garantindo que o jogo só comece quando todos estiverem conectados.
 Queues: A troca de turnos funciona como uma fila lógica, onde cada jogador aguarda sua
 vez de jogar ser sinalizada pelo ZooKeeper antes de realizar uma ação.
 
-Locks (Exclusão Mútua): O `Lock` distribuído foi aplicado na função `iniciar()` para 
-garantir que a operação de reset do jogo seja executada por apenas um jogador por vez.
+Locks: O `Lock` distribuído foi aplicado na função `iniciar()` para garantir 
+que a operação de reset do jogo seja executada por apenas um jogador por vez.
 
 Leader Election: O primeiro jogador é definido através de uma `Election` na função 
 `iniciar()`, onde um líder é eleito de forma distribuída para realizar a primeira jogada.
