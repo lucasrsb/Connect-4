@@ -31,6 +31,7 @@ import sys
 from kazoo.client import KazooClient
 from kazoo.recipe.lock import Lock
 from kazoo.recipe.election import Election
+from kazoo.recipe.queue import LockingQueue
 from kazoo.exceptions import NodeExistsError
 
 class JogoConnect4:
@@ -38,17 +39,12 @@ class JogoConnect4:
         self.meu_id = id_jogador
         self.modo = modo
         
-        #Configuração da conexão com o ZooKeeper
         print(f"Conectando ao ZooKeeper como {self.meu_id}...")
         self.zk = KazooClient(hosts='127.0.0.1:2181', timeout=15)
         self.zk.start()
         
-        #Variáveis para controlar o estado do jogo
         self.jogo_acabou = threading.Event()
-        self.minha_vez = threading.Event() if modo == 'jogador' else None
-        
-        #Inicialização dos timers
-        self.timer_turno = None
+        self.queue = LockingQueue(self.zk, '/connect4/queue') if modo == 'jogador' else None
         self.timer_conexao = None
 
         if self.modo == 'jogador':
@@ -57,9 +53,8 @@ class JogoConnect4:
         self.tabuleiro = self._carregar_tabuleiro_remoto()
 
     def _criar_estrutura_base(self):
-        """Garante que os nós (znodes) principais existem no ZooKeeper."""
         self.zk.ensure_path('/connect4/jogadores')
-        self.zk.ensure_path('/connect4/vez')
+        self.zk.ensure_path('/connect4/queue')
         self.zk.ensure_path('/connect4/vencedor')
         self.zk.ensure_path('/connect4/motivo_vitoria')
         self.zk.ensure_path('/connect4/eleicao')
@@ -69,23 +64,23 @@ class JogoConnect4:
             self.zk.create('/connect4/tabuleiro', tabuleiro_vazio)
 
     def _limpar_para_novo_jogo(self):
-        """Limpa o estado do jogo anterior no ZooKeeper."""
         print("Limpando o servidor para um novo jogo...")
         self.zk.set("/connect4/vencedor", b"")
-        self.zk.set("/connect4/vez", b"")
         self.zk.set("/connect4/motivo_vitoria", b"")
         
+        if self.queue:
+            while len(self.queue) > 0:
+                self.queue.get() 
+                self.queue.consume()
+
         tabuleiro_vazio = json.dumps([[None]*7 for _ in range(6)]).encode()
         self.zk.set("/connect4/tabuleiro", tabuleiro_vazio)
         
-        #Remove jogadores que possam ter ficado da partida anterior
-        jogadores_path = "/connect4/jogadores"
-        if self.zk.exists(jogadores_path):
-            for jogador in self.zk.get_children(jogadores_path):
-                self.zk.delete(f"{jogadores_path}/{jogador}", recursive=True)
+        if self.zk.exists("/connect4/setup_done"):
+            self.zk.delete("/connect4/setup_done")
+
 
     def _carregar_tabuleiro_remoto(self):
-        """Pega o estado atual do tabuleiro do ZooKeeper."""
         try:
             dados, _ = self.zk.get('/connect4/tabuleiro')
             return json.loads(dados.decode())
@@ -93,74 +88,62 @@ class JogoConnect4:
             return [[None]*7 for _ in range(6)]
 
     def _salvar_tabuleiro_remoto(self):
-        """Manda o estado atual do tabuleiro para o ZooKeeper."""
         dados_tabuleiro = json.dumps(self.tabuleiro).encode()
         self.zk.set('/connect4/tabuleiro', dados_tabuleiro)
 
     def _iniciar_observadores(self):
-        """Registra as funções que vão reagir a mudanças no ZooKeeper."""
-        self.zk.DataWatch('/connect4/vez')(self._observar_turno)
         self.zk.DataWatch('/connect4/vencedor')(self._observar_vencedor)
         self.zk.ChildrenWatch('/connect4/jogadores')(self._observar_jogadores)
     
     def _observar_jogadores(self, jogadores):
-        """Chamado quando um jogador entra ou sai."""
-        if self.jogo_acabou.is_set(): return False
+        if self.jogo_acabou.is_set(): return
         
+        if len(jogadores) >= 2:
+            if self.timer_conexao and self.timer_conexao.is_alive():
+                print("\nOponente voltou!")
+                self.timer_conexao.cancel()
+            return
+
         timer_rodando = self.timer_conexao and self.timer_conexao.is_alive()
-
-        if len(jogadores) < 2 and not timer_rodando:
-            if self.timer_turno and self.timer_turno.is_alive():
-                self.timer_turno.cancel()
-
+        if not timer_rodando:
             print("\nOponente desconectou! Iniciando timer de 30s para W.O...")
             self.timer_conexao = threading.Timer(30.0, self._vencer_por_wo, args=['desconexao'])
             self.timer_conexao.start()
-        elif len(jogadores) >= 2 and timer_rodando:
-            print("\nOponente voltou!")
-            self.timer_conexao.cancel()
-
-    def _observar_turno(self, dados, stat):
-        """Chamado quando o turno muda."""
-        if self.jogo_acabou.is_set() or not dados: return
-
-        if self.timer_turno and self.timer_turno.is_alive():
-            self.timer_turno.cancel()
-
-        jogador_da_vez = dados.decode()
-        if jogador_da_vez == self.meu_id:
-            print("\n>> É a sua vez!")
-            self.minha_vez.set()
-        else:
-            self.minha_vez.clear()
-            self.timer_turno = threading.Timer(30.0, self._vencer_por_wo, args=['tempo'])
-            self.timer_turno.start()
 
     def _observar_vencedor(self, dados, stat):
-        """Chamado quando um vencedor é declarado, finalizando o jogo."""
         if dados and not self.jogo_acabou.is_set():
             self.jogo_acabou.set()
-            
-            if self.timer_turno: self.timer_turno.cancel()
             if self.timer_conexao: self.timer_conexao.cancel()
 
     def _vencer_por_wo(self, motivo):
-        """Função chamada pelos timers para declarar vitória."""
-        
-        if not self.zk.get("/connect4/vencedor")[0]:
+        if not self.jogo_acabou.is_set() and not self.zk.get("/connect4/vencedor")[0]:
             print(f"\nFim de jogo! Vitória para {self.meu_id} por {motivo}.")
             self.zk.set('/connect4/motivo_vitoria', motivo.encode())
             self.zk.set('/connect4/vencedor', self.meu_id.encode())
 
+    def _processar_fila_de_turnos(self):
+        while not self.jogo_acabou.is_set():
+            try:
+                dados = self.queue.get(timeout=30.0)
+                
+                if dados is None: 
+                    if not self.jogo_acabou.is_set():
+                        print("\nOponente excedeu o tempo de jogada!")
+                        self._vencer_por_wo('tempo')
+                    continue
+
+                if dados.decode() == self.meu_id:
+                    print("\n>> É a sua vez!")
+                    self._fazer_minha_jogada()
+                    self.queue.consume()
+                else:
+                    self.queue.release()
+            except Exception:
+                if not self.jogo_acabou.is_set():
+                    pass
+                break
+    
     def iniciar(self):
-        """Lógica principal para o modo jogador."""
-        
-        with Lock(self.zk, "/connect4/lock_reinicio"):
-            jogadores_ativos = self.zk.get_children("/connect4/jogadores")
-            if not jogadores_ativos:
-                self._limpar_para_novo_jogo()
-                self.tabuleiro = self._carregar_tabuleiro_remoto()
-        
         try:
             self.zk.create(f"/connect4/jogadores/{self.meu_id}", ephemeral=True)
         except NodeExistsError:
@@ -171,30 +154,39 @@ class JogoConnect4:
         while len(self.zk.get_children('/connect4/jogadores')) < 2:
             if self.jogo_acabou.is_set(): return
             time.sleep(1)
+        
         print("Oponente conectado. O jogo vai começar!")
-
-        if not self.zk.get('/connect4/vez')[0]:
-            print("Sorteando quem vai ser o primeiro...")
-            eleicao = Election(self.zk, '/connect4/eleicao', identifier=self.meu_id)
-            eleicao.run(self._definir_primeiro_jogador)
+        with Lock(self.zk, "/connect4/lock_setup"):
+            # O mestre (quem pega o lock) verifica se o setup já foi feito através do latch.
+            if not self.zk.exists("/connect4/setup_done"):
+                # Se o latch não existe, este processo é o mestre do setup.
+                self._limpar_para_novo_jogo()
+                print("Sorteando quem vai ser o primeiro...")
+                eleicao = Election(self.zk, '/connect4/eleicao', identifier=self.meu_id)
+                eleicao.run(self._definir_primeiro_jogador)
+                
+                # Cria o latch para sinalizar que o setup desta partida está concluído.
+                # Por ser efêmero, ele some quando este cliente desconectar.
+                self.zk.create("/connect4/setup_done", ephemeral=True)
         
         self._iniciar_observadores()
+        
         print("\n=== VALENDO! ===")
-
-        while not self.jogo_acabou.is_set():
-            if self.minha_vez.wait(timeout=1.0):
-                self._fazer_minha_jogada()
-                self.minha_vez.clear()
+        thread_fila = threading.Thread(target=self._processar_fila_de_turnos, daemon=True)
+        thread_fila.start()
+        
+        self.jogo_acabou.wait()
+        
+        if thread_fila.is_alive():
+            thread_fila.join(timeout=1.0) 
         
         self._mostrar_resultado()
-    
-    def _definir_primeiro_jogador(self):
-        """Callback chamado pela eleição quando um líder é escolhido."""
-        print(f"Eu, {self.meu_id}, começo jogando!")
-        self.zk.set('/connect4/vez', self.meu_id.encode())
 
+    def _definir_primeiro_jogador(self):
+        print(f"Eu, {self.meu_id}, começo jogando!")
+        self.queue.put(self.meu_id.encode())
+    
     def _fazer_minha_jogada(self):
-        """Processa a jogada do usuário, desde o input até salvar no ZK."""
         self.tabuleiro = self._carregar_tabuleiro_remoto()
         self._mostrar_tabuleiro()
 
@@ -240,11 +232,10 @@ class JogoConnect4:
                     self.zk.set("/connect4/vencedor", self.meu_id.encode())
                 else:
                     proximo = "player2" if self.meu_id == "player1" else "player1"
-                    self.zk.set("/connect4/vez", proximo.encode())
+                    self.queue.put(proximo.encode())
                 return
 
     def _verificar_se_ganhei(self):
-        """Verifica todas as condições de vitória para o jogador atual."""
         j = self.meu_id
         b = self.tabuleiro
         for r in range(6):
@@ -262,7 +253,6 @@ class JogoConnect4:
         return False
 
     def _mostrar_tabuleiro(self):
-        """Exibe o tabuleiro no console."""
         print("\n" + "-"*25)
         for r in range(6):
             linha_str = " ".join('X' if cell == 'player1' else 'O' if cell == 'player2' else '.' for cell in self.tabuleiro[r])
@@ -271,51 +261,38 @@ class JogoConnect4:
         print("-" * 25)
 
     def _mostrar_resultado(self):
-        """Exibe a tela final de jogo."""
         try:
             vencedor = self.zk.get('/connect4/vencedor')[0].decode()
             motivo = self.zk.get('/connect4/motivo_vitoria')[0].decode()
-        except Exception as e:
-            print(f"Não foi possível obter o resultado final: {e}")
+        except Exception:
+            if self.jogo_acabou.is_set(): return
             return
 
-        self.tabuleiro = self._carregar_tabuleiro_remoto()
-        self._mostrar_tabuleiro()
+        if vencedor or motivo:
+            self.tabuleiro = self._carregar_tabuleiro_remoto()
+            self._mostrar_tabuleiro()
+            print("\n\n=== FIM DE JOGO ===")
+            perdedor = 'player1' if vencedor == 'player2' else 'player2'
 
-        print("\n\n=== FIM DE JOGO ===")
-
-        perdedor = 'player1' if vencedor == 'player2' else 'player2'
-
-        if self.modo == 'espectador':
-            print(f"Vencedor da partida: {vencedor}")
-            if motivo == 'vitoria':
-                print("Motivo: Conectou 4 peças em linha.")
-            elif motivo == 'tempo':
-                print(f"Motivo: O jogador {perdedor} excedeu o tempo de jogada.")
-            elif motivo == 'desconexao':
-                print(f"Motivo: O jogador {perdedor} desconectou.")
-
-        else:
-            if vencedor == self.meu_id:
-                print("PARABÉNS, VOCÊ VENCEU!")
-                if motivo == 'vitoria':
-                    print("Motivo: Você conectou 4 peças em linha.")
-                elif motivo == 'tempo':
-                    print(f"Motivo: O oponente ({perdedor}) excedeu o tempo de jogada.")
-                elif motivo == 'desconexao':
-                    print(f"Motivo: O oponente ({perdedor}) desconectou.")
+            if self.modo == 'espectador':
+                print(f"Vencedor da partida: {vencedor}")
+                if motivo == 'vitoria': print("Motivo: Conectou 4 peças em linha.")
+                elif motivo == 'tempo': print(f"Motivo: O jogador {perdedor} excedeu o tempo de jogada.")
+                elif motivo == 'desconexao': print(f"Motivo: O jogador {perdedor} desconectou.")
             else:
-                print(f"Que pena, você perdeu. O vencedor foi {vencedor}.")
-                if motivo == 'vitoria':
-                    print(f"Motivo: {vencedor} conectou 4 peças em linha.")
-                elif motivo == 'tempo':
-                    print("Motivo: Você excedeu o seu tempo de jogada.")
-                elif motivo == 'desconexao':
-                    print("Motivo: Você foi considerado desconectado da partida.")
-        print("===================\n")
+                if vencedor == self.meu_id:
+                    print("PARABÉNS, VOCÊ VENCEU!")
+                    if motivo == 'vitoria': print("Motivo: Você conectou 4 peças em linha.")
+                    elif motivo == 'tempo': print(f"Motivo: O oponente ({perdedor}) excedeu o tempo de jogada.")
+                    elif motivo == 'desconexao': print(f"Motivo: O oponente ({perdedor}) desconectou.")
+                else:
+                    print(f"Que pena, você perdeu. O vencedor foi {vencedor}.")
+                    if motivo == 'vitoria': print(f"Motivo: {vencedor} conectou 4 peças em linha.")
+                    elif motivo == 'tempo': print("Motivo: Você excedeu o seu tempo de jogada.")
+                    elif motivo == 'desconexao': print("Motivo: Você foi considerado desconectado da partida.")
+            print("===================\n")
 
     def assistir(self):
-        """Lógica para o modo espectador."""
         print("Entrando em modo espectador. Aguardando o jogo começar...")
         self._mostrar_tabuleiro()
 
@@ -332,7 +309,6 @@ class JogoConnect4:
         self._mostrar_resultado()
 
     def fechar(self):
-        """Limpa a conexão com o ZooKeeper."""
         print("Encerrando conexão...")
         if self.zk and self.zk.connected:
             self.zk.stop()
